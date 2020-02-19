@@ -10,11 +10,11 @@ import (
 	"errors"
 	"unsafe"
 
-	"github.com/gobwas/pool/pbytes"
 	"github.com/panjf2000/gnet/internal"
+	"github.com/panjf2000/gnet/pool/bytebuffer"
 )
 
-// ErrIsEmpty will be returned when trying to read a empty ring-buffer
+// ErrIsEmpty will be returned when trying to read a empty ring-buffer.
 var ErrIsEmpty = errors.New("ring-buffer is empty")
 
 // RingBuffer is a circular buffer that implement io.ReaderWriter interface.
@@ -29,9 +29,7 @@ type RingBuffer struct {
 
 // New returns a new RingBuffer whose buffer has the given size.
 func New(size int) *RingBuffer {
-	if !internal.IsPowerOfTwo(size) {
-		panic("the size of ring-buffer must be power of two integer value, e.g. 2, 4, 8, 16, 32, 64, etc.")
-	}
+	size = internal.CeilToPowerOfTwo(size)
 	return &RingBuffer{
 		buf:     make([]byte, size),
 		size:    size,
@@ -40,8 +38,8 @@ func New(size int) *RingBuffer {
 	}
 }
 
-// PreRead reads the bytes with given length but will not move the pointer of "read".
-func (r *RingBuffer) PreRead(len int) (top []byte, tail []byte) {
+// LazyRead reads the bytes with given length but will not move the pointer of "read".
+func (r *RingBuffer) LazyRead(len int) (head []byte, tail []byte) {
 	if r.isEmpty {
 		return
 	}
@@ -56,7 +54,7 @@ func (r *RingBuffer) PreRead(len int) (top []byte, tail []byte) {
 			n = len
 		}
 
-		top = r.buf[r.r : r.r+n]
+		head = r.buf[r.r : r.r+n]
 		return
 	}
 
@@ -66,10 +64,10 @@ func (r *RingBuffer) PreRead(len int) (top []byte, tail []byte) {
 	}
 
 	if r.r+n <= r.size {
-		top = r.buf[r.r : r.r+n]
+		head = r.buf[r.r : r.r+n]
 	} else {
 		c1 := r.size - r.r
-		top = r.buf[r.r:r.size]
+		head = r.buf[r.r:r.size]
 		c2 := n - c1
 		tail = r.buf[0:c2]
 	}
@@ -77,24 +75,24 @@ func (r *RingBuffer) PreRead(len int) (top []byte, tail []byte) {
 	return
 }
 
-// PreReadAll reads the all bytes in this ring-buffer but will not move the pointer of "read".
-func (r *RingBuffer) PreReadAll() (top []byte, tail []byte) {
+// LazyReadAll reads the all bytes in this ring-buffer but will not move the pointer of "read".
+func (r *RingBuffer) LazyReadAll() (head []byte, tail []byte) {
 	if r.isEmpty {
 		return
 	}
 
 	if r.w > r.r {
 		n := r.w - r.r // Length
-		top = r.buf[r.r : r.r+n]
+		head = r.buf[r.r : r.r+n]
 		return
 	}
 
 	n := r.size - r.r + r.w // Length
 	if r.r+n <= r.size {
-		top = r.buf[r.r : r.r+n]
+		head = r.buf[r.r : r.r+n]
 	} else {
 		c1 := r.size - r.r
-		top = r.buf[r.r:r.size]
+		head = r.buf[r.r:r.size]
 		c2 := n - c1
 		tail = r.buf[0:c2]
 	}
@@ -241,7 +239,7 @@ func (r *RingBuffer) WriteByte(c byte) error {
 	return nil
 }
 
-// Length return the length of available read bytes.
+// Length returns the length of available read bytes.
 func (r *RingBuffer) Length() int {
 	if r.r == r.w {
 		if r.isEmpty {
@@ -257,8 +255,13 @@ func (r *RingBuffer) Length() int {
 	return r.size - r.r + r.w
 }
 
-// Capacity returns the size of the underlying buffer.
-func (r *RingBuffer) Capacity() int {
+// Len returns the length of the underlying buffer.
+func (r *RingBuffer) Len() int {
+	return len(r.buf)
+}
+
+// Cap returns the size of the underlying buffer.
+func (r *RingBuffer) Cap() int {
 	return r.size
 }
 
@@ -290,71 +293,62 @@ func (r *RingBuffer) WriteString(s string) (n int, err error) {
 func (r *RingBuffer) Bytes() []byte {
 	if r.isEmpty {
 		return nil
-	} else if r.r == r.w {
-		buf := pbytes.GetLen(r.size)
+	} else if r.w == r.r {
+		buf := make([]byte, r.size)
 		copy(buf, r.buf)
 		return buf
 	}
 
 	if r.w > r.r {
-		buf := pbytes.GetLen(r.w - r.r)
+		buf := make([]byte, r.w-r.r)
 		copy(buf, r.buf[r.r:r.w])
 		return buf
 	}
 
 	n := r.size - r.r + r.w
-	buf := pbytes.GetLen(n)
-
+	buf := make([]byte, n)
 	if r.r+n < r.size {
 		copy(buf, r.buf[r.r:r.r+n])
 	} else {
 		c1 := r.size - r.r
 		copy(buf, r.buf[r.r:r.size])
 		c2 := n - c1
-		copy(buf[c1:], r.buf[0:c2])
+		copy(buf[c1:], r.buf[:c2])
 	}
 
 	return buf
 }
 
-// WithBytes combines the available read bytes and the given bytes. It does not move the read pointer and only copy the available data.
-func (r *RingBuffer) WithBytes(b []byte) []byte {
-	bn := len(b)
+// WithByteBuffer combines the available read bytes and the given bytes. It does not move the read pointer and only copy the available data.
+func (r *RingBuffer) WithByteBuffer(b []byte) *bytebuffer.ByteBuffer {
 	if r.isEmpty {
-		return b
-	} else if r.r == r.w {
-		buf := pbytes.GetLen(r.size + bn)
-		copy(buf, r.buf)
-		copy(buf[r.size:], b)
-		return buf
+		return &bytebuffer.ByteBuffer{B: b}
+	} else if r.w == r.r {
+		bb := bytebuffer.Get()
+		_, _ = bb.Write(r.buf)
+		_, _ = bb.Write(b)
+		return bb
 	}
 
+	bb := bytebuffer.Get()
 	if r.w > r.r {
-		buf := pbytes.GetLen(r.w - r.r + bn)
-		copy(buf, r.buf[r.r:r.w])
-		copy(buf[r.w-r.r:], b)
-		return buf
+		_, _ = bb.Write(r.buf[r.r:r.w])
+		_, _ = bb.Write(b)
+		return bb
 	}
 
 	n := r.size - r.r + r.w
-	buf := pbytes.GetLen(n + bn)
-
 	if r.r+n < r.size {
-		copy(buf, r.buf[r.r:r.r+n])
+		_, _ = bb.Write(r.buf[r.r : r.r+n])
 	} else {
 		c1 := r.size - r.r
-		copy(buf, r.buf[r.r:r.size])
+		_, _ = bb.Write(r.buf[r.r:r.size])
 		c2 := n - c1
-		copy(buf[c1:], r.buf[0:c2])
+		_, _ = bb.Write(r.buf[:c2])
 	}
-	copy(buf[n:], b)
+	_, _ = bb.Write(b)
 
-	return buf
-}
-
-// Recycle recycles slice of bytes.
-func Recycle(p []byte) {
-	pbytes.Put(p)
+	return bb
 }
 
 // IsFull returns this ringbuffer is full.
@@ -376,7 +370,6 @@ func (r *RingBuffer) Reset() {
 
 func (r *RingBuffer) malloc(cap int) {
 	newCap := internal.CeilToPowerOfTwo(r.size + cap)
-	//newBuf := pbytes.GetLen(newCap)
 	newBuf := make([]byte, newCap)
 	oldLen := r.Length()
 	_, _ = r.Read(newBuf)

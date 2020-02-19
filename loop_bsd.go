@@ -6,32 +6,28 @@
 
 package gnet
 
-import (
-	"github.com/panjf2000/gnet/internal"
-	"github.com/panjf2000/gnet/netpoll"
-)
+import "github.com/panjf2000/gnet/internal/netpoll"
 
-func (lp *loop) handleEvent(fd int, filter int16, job internal.Job) error {
-	if fd == 0 {
-		return job()
-	}
-	if c, ok := lp.connections[fd]; ok {
-		switch {
-		case !c.opened:
-			return lp.loopOpen(c)
-		case !c.outboundBuffer.IsEmpty():
+func (el *eventloop) handleEvent(fd int, filter int16) error {
+	if c, ok := el.connections[fd]; ok {
+		if filter == netpoll.EVFilterSock {
+			return el.loopCloseConn(c, nil)
+		}
+		switch c.outboundBuffer.IsEmpty() {
+		// Don't change the ordering of processing EVFILT_WRITE | EVFILT_READ | EV_ERROR/EV_EOF unless you're 100%
+		// sure what you're doing!
+		// Re-ordering can easily introduce bugs and bad side-effects, as I found out painfully in the past.
+		case false:
 			if filter == netpoll.EVFilterWrite {
-				return lp.loopOut(c)
+				return el.loopWrite(c)
 			}
 			return nil
-		case filter == netpoll.EVFilterRead:
-			return lp.loopIn(c)
-		case filter == netpoll.EVFilterSock:
-			return lp.loopCloseConn(c, nil)
-		default:
+		case true:
+			if filter == netpoll.EVFilterRead {
+				return el.loopRead(c)
+			}
 			return nil
 		}
-	} else {
-		return lp.loopAccept(fd)
 	}
+	return el.loopAccept(fd)
 }

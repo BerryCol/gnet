@@ -6,22 +6,15 @@
 package gnet
 
 import (
-	"errors"
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
-	"github.com/panjf2000/gnet/netpoll"
+	"github.com/panjf2000/gnet/internal/netpoll"
 )
-
-var (
-	// ErrClosing indicates this server is closing.
-	ErrClosing = errors.New("closing event-loop")
-)
-
-const socketRingBufferSize = 1024
 
 // Action is an action that occurs after the completion of an event.
 type Action int
@@ -41,115 +34,131 @@ const (
 // running server and has control functions for managing state.
 type Server struct {
 	// Multicore indicates whether the server will be effectively created with multi-cores, if so,
-	// then you must take care with synchonizing memory between all event callbacks, otherwise,
+	// then you must take care of synchronizing the shared data between all event callbacks, otherwise,
 	// it will run the server with single thread. The number of threads in the server will be automatically
 	// assigned to the value of runtime.NumCPU().
 	Multicore bool
 
-	// The addrs parameter is an array of listening addresses that align
+	// The Addr parameter is an array of listening addresses that align
 	// with the addr strings passed to the Serve function.
 	Addr net.Addr
 
 	// NumLoops is the number of loops that the server is using.
 	NumLoops int
+
+	// ReUsePort indicates whether SO_REUSEPORT is enable.
+	ReUsePort bool
+
+	// TCPKeepAlive (SO_KEEPALIVE) socket option.
+	TCPKeepAlive time.Duration
 }
 
 // Conn is a interface of gnet connection.
 type Conn interface {
 	// Context returns a user-defined context.
-	Context() interface{}
+	Context() (ctx interface{})
 
 	// SetContext sets a user-defined context.
-	SetContext(interface{})
+	SetContext(ctx interface{})
 
 	// LocalAddr is the connection's local socket address.
-	LocalAddr() net.Addr
+	LocalAddr() (addr net.Addr)
 
 	// RemoteAddr is the connection's remote peer address.
-	RemoteAddr() net.Addr
+	RemoteAddr() (addr net.Addr)
 
-	// Wake triggers a React event for this connection.
-	//Wake()
-
-	// Read reads all data from the inbound ring-buffer without moving the "read" pointer, which means
-	// it is not consuming the data actually and the data will present in the ring-buffer until the ResetBuffer method
-	// was invoked.
+	// Read reads all data from inbound ring-buffer without moving "read" pointer, which means
+	// it does not evict the data from ring-buffer actually and those data will present in ring-buffer until the
+	// ResetBuffer method is invoked.
 	Read() (buf []byte)
 
-	// ResetBuffer resets the inbound ring-buffer, which means all data in the inbound ring-buffer has been consumed.
+	// ResetBuffer resets the inbound ring-buffer, which means all data in the inbound ring-buffer has been evicted.
 	ResetBuffer()
 
-	// ReadN reads bytes with the given length from the inbound ring-buffer and the event-loop-buffer, it would move the
-	// "read" pointer, which means it will consume the data from buffer and it can't be revoke (put back to buffer),
+	// ShiftN shifts "read" pointer in buffer with the given length.
+	ShiftN(n int) (size int)
+
+	// ReadN reads bytes with the given length from inbound ring-buffer and event-loop-buffer, it would move
+	// "read" pointer, which means it will evict the data from buffer and it can't be revoked (put back to buffer),
 	// it reads data from the inbound ring-buffer and event-loop-buffer when the length of the available data is equal
 	// to the given "n", otherwise, it will not read any data from the inbound ring-buffer. So you should use this
-	// function only if you know exactly the length of subsequent TCP streams based on the protocol, like the
-	// Content-Length attribute in an HTTP request which indicates you how many data you should read from inbound ring-buffer.
+	// function only if you know exactly the length of subsequent TCP stream based on the protocol, like the
+	// Content-Length attribute in an HTTP request which indicates you how much data you should read from inbound ring-buffer.
 	ReadN(n int) (size int, buf []byte)
-
-	// ShiftN shifts the "read" pointer in ring buffer with the given length.
-	//ShiftN(n int)
 
 	// BufferLength returns the length of available data in the inbound ring-buffer.
 	BufferLength() (size int)
 
-	// AyncWrite writes data asynchronously.
+	// InboundBuffer returns the inbound ring-buffer.
+	//InboundBuffer() *ringbuffer.RingBuffer
+
+	// SendTo writes data for UDP sockets, it allows you to send data back to UDP socket in individual goroutines.
+	SendTo(buf []byte)
+
+	// AsyncWrite writes data to client/connection asynchronously, usually you would invoke it in individual goroutines
+	// instead of the event-loop goroutines.
 	AsyncWrite(buf []byte)
+
+	// Wake triggers a React event for this connection.
+	Wake() error
+
+	// Close closes the current connection.
+	Close() error
 }
 
-// EventHandler represents the server events' callbacks for the Serve call.
-// Each event has an Action return value that is used manage the state
-// of the connection and server.
-type EventHandler interface {
-	// OnInitComplete fires when the server can accept connections. The server
-	// parameter has information and various utilities.
-	OnInitComplete(server Server) (action Action)
+type (
+	// EventHandler represents the server events' callbacks for the Serve call.
+	// Each event has an Action return value that is used manage the state
+	// of the connection and server.
+	EventHandler interface {
+		// OnInitComplete fires when the server is ready for accepting connections.
+		// The server parameter has information and various utilities.
+		OnInitComplete(server Server) (action Action)
 
-	// OnOpened fires when a new connection has opened.
-	// The info parameter has information about the connection such as
-	// it's local and remote address.
-	// Use the out return value to write data to the connection.
-	// The opts return value is used to set connection options.
-	OnOpened(c Conn) (out []byte, action Action)
+		// OnOpened fires when a new connection has been opened.
+		// The info parameter has information about the connection such as
+		// it's local and remote address.
+		// Use the out return value to write data to the connection.
+		OnOpened(c Conn) (out []byte, action Action)
 
-	// OnClosed fires when a connection has closed.
-	// The err parameter is the last known connection error.
-	OnClosed(c Conn, err error) (action Action)
+		// OnClosed fires when a connection has been closed.
+		// The err parameter is the last known connection error.
+		OnClosed(c Conn, err error) (action Action)
 
-	// PreWrite fires just before any data is written to any client socket.
-	PreWrite()
+		// PreWrite fires just before any data is written to any client socket.
+		PreWrite()
 
-	// React fires when a connection sends the server data.
-	// The in parameter is the incoming data.
-	// Use the out return value to write data to the connection.
-	React(c Conn) (out []byte, action Action)
+		// React fires when a connection sends the server data.
+		// Invoke c.Read() or c.ReadN(n) within the parameter c to read incoming data from client/connection.
+		// Use the out return value to write data to the client/connection.
+		React(frame []byte, c Conn) (out []byte, action Action)
 
-	// Tick fires immediately after the server starts and will fire again
-	// following the duration specified by the delay return value.
-	Tick() (delay time.Duration, action Action)
-}
+		// Tick fires immediately after the server starts and will fire again
+		// following the duration specified by the delay return value.
+		Tick() (delay time.Duration, action Action)
+	}
 
-// EventServer is a built-in implementation of EventHandler which sets up each method with a default implementation,
-// you can compose it with your own implementation of EventHandler when you don't want to implement all methods in EventHandler.
-type EventServer struct {
-}
+	// EventServer is a built-in implementation of EventHandler which sets up each method with a default implementation,
+	// you can compose it with your own implementation of EventHandler when you don't want to implement all methods in EventHandler.
+	EventServer struct {
+	}
+)
 
-// OnInitComplete fires when the server can accept connections. The server
-// parameter has information and various utilities.
+// OnInitComplete fires when the server is ready for accepting connections.
+// The server parameter has information and various utilities.
 func (es *EventServer) OnInitComplete(svr Server) (action Action) {
 	return
 }
 
-// OnOpened fires when a new connection has opened.
+// OnOpened fires when a new connection has been opened.
 // The info parameter has information about the connection such as
 // it's local and remote address.
 // Use the out return value to write data to the connection.
-// The opts return value is used to set connection options.
 func (es *EventServer) OnOpened(c Conn) (out []byte, action Action) {
 	return
 }
 
-// OnClosed fires when a connection has closed.
+// OnClosed fires when a connection has been closed.
 // The err parameter is the last known connection error.
 func (es *EventServer) OnClosed(c Conn, err error) (action Action) {
 	return
@@ -160,9 +169,9 @@ func (es *EventServer) PreWrite() {
 }
 
 // React fires when a connection sends the server data.
-// The in parameter is the incoming data.
-// Use the out return value to write data to the connection.
-func (es *EventServer) React(c Conn) (out []byte, action Action) {
+// Invoke c.Read() or c.ReadN(n) within the parameter c to read incoming data from client/connection.
+// Use the out return value to write data to the client/connection.
+func (es *EventServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	return
 }
 
@@ -188,23 +197,31 @@ func (es *EventServer) Tick() (delay time.Duration, action Action) {
 // The "tcp" network scheme is assumed when one is not specified.
 func Serve(eventHandler EventHandler, addr string, opts ...Option) error {
 	var ln listener
-	defer ln.close()
+	defer func() {
+		ln.close()
+		if ln.network == "unix" {
+			sniffError(os.RemoveAll(ln.addr))
+		}
+	}()
 
 	options := initOptions(opts...)
 
 	ln.network, ln.addr = parseAddr(addr)
 	if ln.network == "unix" {
 		sniffError(os.RemoveAll(ln.addr))
+		if runtime.GOOS == "windows" {
+			return errProtocolNotSupported
+		}
 	}
 	var err error
 	if ln.network == "udp" {
-		if options.ReusePort {
+		if options.ReusePort && runtime.GOOS != "windows" {
 			ln.pconn, err = netpoll.ReusePortListenPacket(ln.network, ln.addr)
 		} else {
 			ln.pconn, err = net.ListenPacket(ln.network, ln.addr)
 		}
 	} else {
-		if options.ReusePort {
+		if options.ReusePort && runtime.GOOS != "windows" {
 			ln.ln, err = netpoll.ReusePortListen(ln.network, ln.addr)
 		} else {
 			ln.ln, err = net.Listen(ln.network, ln.addr)
@@ -228,24 +245,15 @@ func parseAddr(addr string) (network, address string) {
 	network = "tcp"
 	address = addr
 	if strings.Contains(address, "://") {
-		network = strings.Split(address, "://")[0]
-		address = strings.Split(address, "://")[1]
+		parts := strings.Split(address, "://")
+		network = parts[0]
+		address = parts[1]
 	}
 	return
 }
 
-type listener struct {
-	ln      net.Listener
-	lnaddr  net.Addr
-	pconn   net.PacketConn
-	f       *os.File
-	fd      int
-	network string
-	addr    string
-}
-
 func sniffError(err error) {
-	if err != nil {
+	if err != nil && err != errServerShutdown {
 		log.Println(err)
 	}
 }

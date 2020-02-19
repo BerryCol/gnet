@@ -6,40 +6,44 @@
 
 package gnet
 
-import (
-	"github.com/panjf2000/gnet/internal"
-	"github.com/panjf2000/gnet/netpoll"
-)
+import "github.com/panjf2000/gnet/internal/netpoll"
 
 func (svr *server) activateMainReactor() {
 	defer svr.signalShutdown()
 
-	_ = svr.mainLoop.poller.Polling(func(fd int, filter int16, job internal.Job) error {
+	sniffError(svr.mainLoop.poller.Polling(func(fd int, filter int16) error {
 		return svr.acceptNewConnection(fd)
-	})
+	}))
 }
 
-func (svr *server) activateSubReactor(lp *loop) {
+func (svr *server) activateSubReactor(el *eventloop) {
 	defer svr.signalShutdown()
 
-	if lp.idx == 0 && svr.opts.Ticker {
-		go lp.loopTicker()
+	if el.idx == 0 && svr.opts.Ticker {
+		go el.loopTicker()
 	}
 
-	_ = lp.poller.Polling(func(fd int, filter int16, job internal.Job) error {
-		c := lp.connections[fd]
-		switch {
-		case !c.outboundBuffer.IsEmpty():
-			if filter == netpoll.EVFilterWrite {
-				return lp.loopOut(c)
+	sniffError(el.poller.Polling(func(fd int, filter int16) error {
+		if c, ack := el.connections[fd]; ack {
+			if filter == netpoll.EVFilterSock {
+				return el.loopCloseConn(c, nil)
 			}
-			return nil
-		case filter == netpoll.EVFilterRead:
-			return lp.loopIn(c)
-		case filter == netpoll.EVFilterSock:
-			return lp.loopCloseConn(c, nil)
-		default:
-			return nil
+			switch c.outboundBuffer.IsEmpty() {
+			// Don't change the ordering of processing EVFILT_WRITE | EVFILT_READ | EV_ERROR/EV_EOF unless you're 100%
+			// sure what you're doing!
+			// Re-ordering can easily introduce bugs and bad side-effects, as I found out painfully in the past.
+			case false:
+				if filter == netpoll.EVFilterWrite {
+					return el.loopWrite(c)
+				}
+				return nil
+			case true:
+				if filter == netpoll.EVFilterRead {
+					return el.loopRead(c)
+				}
+				return nil
+			}
 		}
-	})
+		return nil
+	}))
 }

@@ -19,28 +19,30 @@ package gnet
 //)
 
 // IEventLoopGroup represents a set of event-loops.
-type IEventLoopGroup interface {
-	register(*loop)
-	next() *loop
-	iterate(func(int, *loop) bool)
-	len() int
-}
+type (
+	IEventLoopGroup interface {
+		register(*eventloop)
+		next() *eventloop
+		iterate(func(int, *eventloop) bool)
+		len() int
+	}
 
-type eventLoopGroup struct {
-	nextLoopIndex int
-	eventLoops    []*loop
-	size          int
-}
+	eventLoopGroup struct {
+		nextLoopIndex int
+		eventLoops    []*eventloop
+		size          int
+	}
+)
 
-func (g *eventLoopGroup) register(lp *loop) {
-	g.eventLoops = append(g.eventLoops, lp)
+func (g *eventLoopGroup) register(el *eventloop) {
+	g.eventLoops = append(g.eventLoops, el)
 	g.size++
 }
 
 // Built-in load-balance algorithm is Round-Robin.
 // TODO: support more load-balance algorithms.
-func (g *eventLoopGroup) next() (lp *loop) {
-	lp = g.eventLoops[g.nextLoopIndex]
+func (g *eventLoopGroup) next() (el *eventloop) {
+	el = g.eventLoops[g.nextLoopIndex]
 	g.nextLoopIndex++
 	if g.nextLoopIndex >= g.size {
 		g.nextLoopIndex = 0
@@ -48,9 +50,9 @@ func (g *eventLoopGroup) next() (lp *loop) {
 	return
 }
 
-func (g *eventLoopGroup) iterate(f func(int, *loop) bool) {
-	for i, lp := range g.eventLoops {
-		if !f(i, lp) {
+func (g *eventLoopGroup) iterate(f func(int, *eventloop) bool) {
+	for i, el := range g.eventLoops {
+		if !f(i, el) {
 			break
 		}
 	}
