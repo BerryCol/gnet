@@ -1,18 +1,32 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-
-// Copyright 2019 smallnest&Allenxuxu. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Chao yuepan, Andy Pan, Allen Xu
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 package ringbuffer
 
 import (
 	"errors"
-	"unsafe"
 
 	"github.com/panjf2000/gnet/internal"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
 )
+
+const initSize = 1 << 12 // 4096 bytes for the first-time allocation on ring-buffer.
 
 // ErrIsEmpty will be returned when trying to read a empty ring-buffer.
 var ErrIsEmpty = errors.New("ring-buffer is empty")
@@ -29,6 +43,9 @@ type RingBuffer struct {
 
 // New returns a new RingBuffer whose buffer has the given size.
 func New(size int) *RingBuffer {
+	if size == 0 {
+		return &RingBuffer{isEmpty: true}
+	}
 	size = internal.CeilToPowerOfTwo(size)
 	return &RingBuffer{
 		buf:     make([]byte, size),
@@ -53,7 +70,6 @@ func (r *RingBuffer) LazyRead(len int) (head []byte, tail []byte) {
 		if n > len {
 			n = len
 		}
-
 		head = r.buf[r.r : r.r+n]
 		return
 	}
@@ -67,9 +83,9 @@ func (r *RingBuffer) LazyRead(len int) (head []byte, tail []byte) {
 		head = r.buf[r.r : r.r+n]
 	} else {
 		c1 := r.size - r.r
-		head = r.buf[r.r:r.size]
+		head = r.buf[r.r:]
 		c2 := n - c1
-		tail = r.buf[0:c2]
+		tail = r.buf[:c2]
 	}
 
 	return
@@ -82,32 +98,26 @@ func (r *RingBuffer) LazyReadAll() (head []byte, tail []byte) {
 	}
 
 	if r.w > r.r {
-		n := r.w - r.r // Length
-		head = r.buf[r.r : r.r+n]
+		head = r.buf[r.r:r.w]
 		return
 	}
 
-	n := r.size - r.r + r.w // Length
-	if r.r+n <= r.size {
-		head = r.buf[r.r : r.r+n]
-	} else {
-		c1 := r.size - r.r
-		head = r.buf[r.r:r.size]
-		c2 := n - c1
-		tail = r.buf[0:c2]
+	head = r.buf[r.r:]
+	if r.w != 0 {
+		tail = r.buf[:r.w]
 	}
 
 	return
 }
 
 // Shift shifts the "read" pointer.
-func (r *RingBuffer) Shift(len int) {
-	if len <= 0 {
+func (r *RingBuffer) Shift(n int) {
+	if n <= 0 {
 		return
 	}
 
-	if len < r.Length() {
-		r.r = (r.r + len) & r.mask
+	if n < r.Length() {
+		r.r = (r.r + n) & r.mask
 		if r.r == r.w {
 			r.isEmpty = true
 		}
@@ -116,13 +126,17 @@ func (r *RingBuffer) Shift(len int) {
 	}
 }
 
-// Read reads up to len(p) bytes into p. It returns the number of bytes read (0 <= n <= len(p)) and any error encountered.
+// Read reads up to len(p) bytes into p. It returns the number of bytes read (0 <= n <= len(p)) and any error
+// encountered.
 // Even if Read returns n < len(p), it may use all of p as scratch space during the call.
-// If some data is available but not len(p) bytes, Read conventionally returns what is available instead of waiting for more.
+// If some data is available but not len(p) bytes, Read conventionally returns what is available instead of waiting
+// for more.
 // When Read encounters an error or end-of-file condition after successfully reading n > 0 bytes,
-// it returns the number of bytes read. It may return the (non-nil) error from the same call or return the error (and n == 0) from a subsequent call.
+// it returns the number of bytes read. It may return the (non-nil) error from the same call or return the
+// error (and n == 0) from a subsequent call.
 // Callers should always process the n > 0 bytes returned before considering the error err.
-// Doing so correctly handles I/O errors that happen after reading some bytes and also both of the allowed EOF behaviors.
+// Doing so correctly handles I/O errors that happen after reading some bytes and also both of the allowed EOF
+// behaviors.
 func (r *RingBuffer) Read(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -138,7 +152,7 @@ func (r *RingBuffer) Read(p []byte) (n int, err error) {
 			n = len(p)
 		}
 		copy(p, r.buf[r.r:r.r+n])
-		r.r = (r.r + n) & r.mask
+		r.r += n
 		if r.r == r.w {
 			r.isEmpty = true
 		}
@@ -154,9 +168,9 @@ func (r *RingBuffer) Read(p []byte) (n int, err error) {
 		copy(p, r.buf[r.r:r.r+n])
 	} else {
 		c1 := r.size - r.r
-		copy(p, r.buf[r.r:r.size])
+		copy(p, r.buf[r.r:])
 		c2 := n - c1
-		copy(p[c1:], r.buf[0:c2])
+		copy(p[c1:], r.buf[:c2])
 	}
 	r.r = (r.r + n) & r.mask
 	if r.r == r.w {
@@ -184,8 +198,10 @@ func (r *RingBuffer) ReadByte() (b byte, err error) {
 }
 
 // Write writes len(p) bytes from p to the underlying buf.
-// It returns the number of bytes written from p (n == len(p) > 0) and any error encountered that caused the write to stop early.
-// If the length of p is greater than the writable capacity of this ring-buffer, it will allocate more memory to this ring-buffer.
+// It returns the number of bytes written from p (n == len(p) > 0) and any error encountered that caused the write to
+// stop early.
+// If the length of p is greater than the writable capacity of this ring-buffer, it will allocate more memory to
+// this ring-buffer.
 // Write must not modify the slice data, even temporarily.
 func (r *RingBuffer) Write(p []byte) (n int, err error) {
 	n = len(p)
@@ -206,7 +222,7 @@ func (r *RingBuffer) Write(p []byte) (n int, err error) {
 		} else {
 			copy(r.buf[r.w:], p[:c1])
 			c2 := n - c1
-			copy(r.buf[0:], p[c1:])
+			copy(r.buf, p[c1:])
 			r.w = c2
 		}
 	} else {
@@ -223,7 +239,7 @@ func (r *RingBuffer) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// WriteByte writes one byte into buffer
+// WriteByte writes one byte into buffer.
 func (r *RingBuffer) WriteByte(c byte) error {
 	if r.Free() < 1 {
 		r.malloc(1)
@@ -283,49 +299,44 @@ func (r *RingBuffer) Free() int {
 
 // WriteString writes the contents of the string s to buffer, which accepts a slice of bytes.
 func (r *RingBuffer) WriteString(s string) (n int, err error) {
-	x := (*[2]uintptr)(unsafe.Pointer(&s))
-	h := [3]uintptr{x[0], x[1], x[1]}
-	buf := *(*[]byte)(unsafe.Pointer(&h))
-	return r.Write(buf)
+	return r.Write(internal.StringToBytes(s))
 }
 
-// Bytes returns all available read bytes. It does not move the read pointer and only copy the available data.
-func (r *RingBuffer) Bytes() []byte {
+// ByteBuffer returns all available read bytes. It does not move the read pointer and only copy the available data.
+func (r *RingBuffer) ByteBuffer() *bytebuffer.ByteBuffer {
 	if r.isEmpty {
 		return nil
 	} else if r.w == r.r {
-		buf := make([]byte, r.size)
-		copy(buf, r.buf)
-		return buf
+		bb := bytebuffer.Get()
+		_, _ = bb.Write(r.buf[r.r:])
+		_, _ = bb.Write(r.buf[:r.w])
+		return bb
 	}
 
+	bb := bytebuffer.Get()
 	if r.w > r.r {
-		buf := make([]byte, r.w-r.r)
-		copy(buf, r.buf[r.r:r.w])
-		return buf
+		_, _ = bb.Write(r.buf[r.r:r.w])
+		return bb
 	}
 
-	n := r.size - r.r + r.w
-	buf := make([]byte, n)
-	if r.r+n < r.size {
-		copy(buf, r.buf[r.r:r.r+n])
-	} else {
-		c1 := r.size - r.r
-		copy(buf, r.buf[r.r:r.size])
-		c2 := n - c1
-		copy(buf[c1:], r.buf[:c2])
+	_, _ = bb.Write(r.buf[r.r:])
+
+	if r.w != 0 {
+		_, _ = bb.Write(r.buf[:r.w])
 	}
 
-	return buf
+	return bb
 }
 
-// WithByteBuffer combines the available read bytes and the given bytes. It does not move the read pointer and only copy the available data.
+// WithByteBuffer combines the available read bytes and the given bytes. It does not move the read pointer and
+// only copy the available data.
 func (r *RingBuffer) WithByteBuffer(b []byte) *bytebuffer.ByteBuffer {
 	if r.isEmpty {
 		return &bytebuffer.ByteBuffer{B: b}
 	} else if r.w == r.r {
 		bb := bytebuffer.Get()
-		_, _ = bb.Write(r.buf)
+		_, _ = bb.Write(r.buf[r.r:])
+		_, _ = bb.Write(r.buf[:r.w])
 		_, _ = bb.Write(b)
 		return bb
 	}
@@ -337,14 +348,10 @@ func (r *RingBuffer) WithByteBuffer(b []byte) *bytebuffer.ByteBuffer {
 		return bb
 	}
 
-	n := r.size - r.r + r.w
-	if r.r+n < r.size {
-		_, _ = bb.Write(r.buf[r.r : r.r+n])
-	} else {
-		c1 := r.size - r.r
-		_, _ = bb.Write(r.buf[r.r:r.size])
-		c2 := n - c1
-		_, _ = bb.Write(r.buf[:c2])
+	_, _ = bb.Write(r.buf[r.r:])
+
+	if r.w != 0 {
+		_, _ = bb.Write(r.buf[:r.w])
 	}
 	_, _ = bb.Write(b)
 
@@ -369,7 +376,12 @@ func (r *RingBuffer) Reset() {
 }
 
 func (r *RingBuffer) malloc(cap int) {
-	newCap := internal.CeilToPowerOfTwo(r.size + cap)
+	var newCap int
+	if r.size == 0 && initSize >= cap {
+		newCap = initSize
+	} else {
+		newCap = internal.CeilToPowerOfTwo(r.size + cap)
+	}
 	newBuf := make([]byte, newCap)
 	oldLen := r.Length()
 	_, _ = r.Read(newBuf)

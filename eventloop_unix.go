@@ -1,32 +1,77 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
-// +build linux darwin netbsd freebsd openbsd dragonfly
+// +build linux freebsd dragonfly darwin
 
 package gnet
 
 import (
-	"net"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
 	"time"
+	"unsafe"
 
+	gerrors "github.com/panjf2000/gnet/errors"
 	"github.com/panjf2000/gnet/internal/netpoll"
 	"golang.org/x/sys/unix"
 )
 
 type eventloop struct {
-	idx          int             // loop index in the server loops list
-	svr          *server         // server in loop
-	codec        ICodec          // codec for TCP
-	packet       []byte          // read packet buffer
-	poller       *netpoll.Poller // epoll or kqueue
-	connections  map[int]*conn   // loop connections fd -> conn
-	eventHandler EventHandler    // user eventHandler
+	internalEventloop
+
+	// Prevents eventloop from false sharing by padding extra memory with the difference
+	// between the cache line size "s" and (eventloop mod s) for the most common CPU architectures.
+	_ [64 - unsafe.Sizeof(internalEventloop{})%64]byte
 }
 
-func (el *eventloop) loopRun() {
+type internalEventloop struct {
+	ln                *listener               // listener
+	idx               int                     // loop index in the server loops list
+	svr               *server                 // server in loop
+	poller            *netpoll.Poller         // epoll or kqueue
+	packet            []byte                  // read packet buffer
+	connCount         int32                   // number of active connections in event-loop
+	connections       map[int]*conn           // loop connections fd -> conn
+	eventHandler      EventHandler            // user eventHandler
+	calibrateCallback func(*eventloop, int32) // callback func for re-adjusting connCount
+}
+
+func (el *eventloop) closeAllConns() {
+	// Close loops and all outstanding connections
+	for _, c := range el.connections {
+		_ = el.loopCloseConn(c, nil)
+	}
+}
+
+func (el *eventloop) loopRun(lockOSThread bool) {
+	if lockOSThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
 	defer func() {
+		el.closeAllConns()
+		el.ln.close()
 		if el.idx == 0 && el.svr.opts.Ticker {
 			close(el.svr.ticktock)
 		}
@@ -37,44 +82,44 @@ func (el *eventloop) loopRun() {
 		go el.loopTicker()
 	}
 
-	sniffError(el.poller.Polling(el.handleEvent))
+	err := el.poller.Polling(el.handleEvent)
+	el.svr.logger.Infof("Event-loop(%d) is exiting due to error: %v", el.idx, err)
 }
 
 func (el *eventloop) loopAccept(fd int) error {
-	if fd == el.svr.ln.fd {
-		if el.svr.ln.pconn != nil {
+	if fd == el.ln.fd {
+		if el.ln.network == "udp" {
 			return el.loopReadUDP(fd)
 		}
+
 		nfd, sa, err := unix.Accept(fd)
 		if err != nil {
 			if err == unix.EAGAIN {
 				return nil
 			}
+			return os.NewSyscallError("accept", err)
+		}
+		if err = os.NewSyscallError("fcntl nonblock", unix.SetNonblock(nfd, true)); err != nil {
 			return err
 		}
-		if err := unix.SetNonblock(nfd, true); err != nil {
-			return err
-		}
-		c := newTCPConn(nfd, el, sa)
+
+		netAddr := netpoll.SockaddrToTCPOrUnixAddr(sa)
+		c := newTCPConn(nfd, el, sa, netAddr)
 		if err = el.poller.AddRead(c.fd); err == nil {
 			el.connections[c.fd] = c
 			return el.loopOpen(c)
 		}
 		return err
 	}
+
 	return nil
 }
 
 func (el *eventloop) loopOpen(c *conn) error {
 	c.opened = true
-	c.localAddr = el.svr.ln.lnaddr
-	c.remoteAddr = netpoll.SockaddrToTCPOrUnixAddr(c.sa)
+	el.calibrateCallback(el, 1)
+
 	out, action := el.eventHandler.OnOpened(c)
-	if el.svr.opts.TCPKeepAlive > 0 {
-		if _, ok := el.svr.ln.ln.(*net.TCPListener); ok {
-			_ = netpoll.SetKeepAlive(c.fd, int(el.svr.opts.TCPKeepAlive/time.Second))
-		}
-	}
 	if out != nil {
 		c.open(out)
 	}
@@ -92,25 +137,28 @@ func (el *eventloop) loopRead(c *conn) error {
 		if err == unix.EAGAIN {
 			return nil
 		}
-		return el.loopCloseConn(c, err)
+		return el.loopCloseConn(c, os.NewSyscallError("read", err))
 	}
 	c.buffer = el.packet[:n]
 
 	for inFrame, _ := c.read(); inFrame != nil; inFrame, _ = c.read() {
 		out, action := el.eventHandler.React(inFrame, c)
 		if out != nil {
-			outFrame, _ := el.codec.Encode(c, out)
-			c.write(outFrame)
+			el.eventHandler.PreWrite()
+			if err = c.write(out); err != nil {
+				return err
+			}
 		}
 		switch action {
 		case None:
 		case Close:
-			_ = el.loopWrite(c)
 			return el.loopCloseConn(c, nil)
 		case Shutdown:
-			_ = el.loopWrite(c)
-			return errServerShutdown
+			return gerrors.ErrServerShutdown
 		}
+
+		// Check the status of connection every loop since it might be closed during writing data back to client due to
+		// some kind of system error.
 		if !c.opened {
 			return nil
 		}
@@ -129,17 +177,17 @@ func (el *eventloop) loopWrite(c *conn) error {
 		if err == unix.EAGAIN {
 			return nil
 		}
-		return el.loopCloseConn(c, err)
+		return el.loopCloseConn(c, os.NewSyscallError("write", err))
 	}
 	c.outboundBuffer.Shift(n)
 
-	if len(head) == n && tail != nil {
+	if n == len(head) && tail != nil {
 		n, err = unix.Write(c.fd, tail)
 		if err != nil {
 			if err == unix.EAGAIN {
 				return nil
 			}
-			return el.loopCloseConn(c, err)
+			return el.loopCloseConn(c, os.NewSyscallError("write", err))
 		}
 		c.outboundBuffer.Shift(n)
 	}
@@ -147,19 +195,49 @@ func (el *eventloop) loopWrite(c *conn) error {
 	if c.outboundBuffer.IsEmpty() {
 		_ = el.poller.ModRead(c.fd)
 	}
+
 	return nil
 }
 
-func (el *eventloop) loopCloseConn(c *conn, err error) error {
-	if el.poller.Delete(c.fd) == nil && unix.Close(c.fd) == nil {
+func (el *eventloop) loopCloseConn(c *conn, err error) (rerr error) {
+	if !c.opened {
+		return fmt.Errorf("the fd=%d in event-loop(%d) is already closed, skipping it", c.fd, el.idx)
+	}
+
+	// Send residual data in buffer back to client before actually closing the connection.
+	if !c.outboundBuffer.IsEmpty() {
+		el.eventHandler.PreWrite()
+
+		head, tail := c.outboundBuffer.LazyReadAll()
+		if n, err := unix.Write(c.fd, head); err == nil {
+			if n == len(head) && tail != nil {
+				_, _ = unix.Write(c.fd, tail)
+			}
+		}
+	}
+
+	if err0, err1 := el.poller.Delete(c.fd), unix.Close(c.fd); err0 == nil && err1 == nil {
 		delete(el.connections, c.fd)
-		switch el.eventHandler.OnClosed(c, err) {
-		case Shutdown:
-			return errServerShutdown
+		el.calibrateCallback(el, -1)
+		if el.eventHandler.OnClosed(c, err) == Shutdown {
+			return gerrors.ErrServerShutdown
 		}
 		c.releaseTCP()
+	} else {
+		if err0 != nil {
+			rerr = fmt.Errorf("failed to delete fd=%d from poller in event-loop(%d): %v", c.fd, el.idx, err0)
+		}
+		if err1 != nil {
+			err1 = fmt.Errorf("failed to close fd=%d in event-loop(%d): %v", c.fd, el.idx, os.NewSyscallError("close", err1))
+			if rerr != nil {
+				rerr = errors.New(rerr.Error() + " & " + err1.Error())
+			} else {
+				rerr = err1
+			}
+		}
 	}
-	return nil
+
+	return
 }
 
 func (el *eventloop) loopWake(c *conn) error {
@@ -168,9 +246,11 @@ func (el *eventloop) loopWake(c *conn) error {
 	//}
 	out, action := el.eventHandler.React(nil, c)
 	if out != nil {
-		frame, _ := el.codec.Encode(c, out)
-		c.write(frame)
+		if err := c.write(out); err != nil {
+			return err
+		}
 	}
+
 	return el.handleAction(c, action)
 }
 
@@ -178,18 +258,23 @@ func (el *eventloop) loopTicker() {
 	var (
 		delay time.Duration
 		open  bool
+		err   error
 	)
 	for {
-		sniffError(el.poller.Trigger(func() (err error) {
+		err = el.poller.Trigger(func() (err error) {
 			delay, action := el.eventHandler.Tick()
 			el.svr.ticktock <- delay
 			switch action {
 			case None:
 			case Shutdown:
-				err = errServerShutdown
+				err = gerrors.ErrServerShutdown
 			}
 			return
-		}))
+		})
+		if err != nil {
+			el.svr.logger.Errorf("Failed to awake poller in event-loop(%d), error:%v, stopping ticker", el.idx, err)
+			break
+		}
 		if delay, open = <-el.svr.ticktock; open {
 			time.Sleep(delay)
 		} else {
@@ -203,11 +288,9 @@ func (el *eventloop) handleAction(c *conn, action Action) error {
 	case None:
 		return nil
 	case Close:
-		_ = el.loopWrite(c)
 		return el.loopCloseConn(c, nil)
 	case Shutdown:
-		_ = el.loopWrite(c)
-		return errServerShutdown
+		return gerrors.ErrServerShutdown
 	default:
 		return nil
 	}
@@ -215,19 +298,24 @@ func (el *eventloop) handleAction(c *conn, action Action) error {
 
 func (el *eventloop) loopReadUDP(fd int) error {
 	n, sa, err := unix.Recvfrom(fd, el.packet, 0)
-	if err != nil || n == 0 {
-		return nil
+	if err != nil {
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			return nil
+		}
+		return fmt.Errorf("failed to read UDP packet from fd=%d in event-loop(%d), %v",
+			fd, el.idx, os.NewSyscallError("recvfrom", err))
 	}
+
 	c := newUDPConn(fd, el, sa)
 	out, action := el.eventHandler.React(el.packet[:n], c)
 	if out != nil {
 		el.eventHandler.PreWrite()
-		c.sendTo(out)
+		_ = c.sendTo(out)
 	}
-	switch action {
-	case Shutdown:
-		return errServerShutdown
+	if action == Shutdown {
+		return gerrors.ErrServerShutdown
 	}
 	c.releaseUDP()
+
 	return nil
 }

@@ -1,21 +1,39 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
-
-// +build windows
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
 import (
+	"runtime"
 	"time"
-
-	"github.com/panjf2000/gnet/pool/bytebuffer"
 )
 
-func (svr *server) listenerRun() {
+func (svr *server) listenerRun(lockOSThread bool) {
+	if lockOSThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
 	var err error
-	defer func() { svr.signalShutdown(err) }()
+	defer func() { svr.signalShutdownWithErr(err) }()
 	var packet [0x10000]byte
 	for {
 		if svr.ln.pconn != nil {
@@ -25,11 +43,10 @@ func (svr *server) listenerRun() {
 				err = e
 				return
 			}
-			buf := bytebuffer.Get()
-			_, _ = buf.Write(packet[:n])
 
-			el := svr.subLoopGroup.next()
-			el.ch <- &udpIn{newUDPConn(el, svr.ln.lnaddr, addr, buf)}
+			el := svr.lb.next(addr)
+			c := newUDPConn(el, svr.ln.lnaddr, addr)
+			el.ch <- packUDPConn(c, packet[:n])
 		} else {
 			// Accept TCP socket.
 			conn, e := svr.ln.ln.Accept()
@@ -37,7 +54,7 @@ func (svr *server) listenerRun() {
 				err = e
 				return
 			}
-			el := svr.subLoopGroup.next()
+			el := svr.lb.next(conn.RemoteAddr())
 			c := newTCPConn(conn, el)
 			el.ch <- c
 			go func() {
@@ -49,9 +66,7 @@ func (svr *server) listenerRun() {
 						el.ch <- &stderr{c, err}
 						return
 					}
-					buf := bytebuffer.Get()
-					_, _ = buf.Write(packet[:n])
-					el.ch <- &tcpIn{c, buf}
+					el.ch <- packTCPConn(c, packet[:n])
 				}
 			}()
 		}

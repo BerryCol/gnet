@@ -1,9 +1,23 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
-
-// +build windows
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
@@ -24,12 +38,12 @@ type wakeReq struct {
 	c *stdConn
 }
 
-type tcpIn struct {
+type tcpConn struct {
 	c  *stdConn
-	in *bytebuffer.ByteBuffer
+	bb *bytebuffer.ByteBuffer
 }
 
-type udpIn struct {
+type udpConn struct {
 	c *stdConn
 }
 
@@ -37,7 +51,6 @@ type stdConn struct {
 	ctx           interface{}            // user-defined context
 	conn          net.Conn               // original connection
 	loop          *eventloop             // owner event-loop
-	done          int32                  // 0: attached, 1: closed
 	buffer        *bytebuffer.ByteBuffer // reuse memory of inbound data as a temporary buffer
 	codec         ICodec                 // codec for TCP
 	localAddr     net.Addr               // local server addr
@@ -46,31 +59,54 @@ type stdConn struct {
 	inboundBuffer *ringbuffer.RingBuffer // buffer for data from client
 }
 
-func newTCPConn(conn net.Conn, el *eventloop) *stdConn {
-	return &stdConn{
+func packTCPConn(c *stdConn, buf []byte) *tcpConn {
+	packet := &tcpConn{c: c}
+	packet.bb = bytebuffer.Get()
+	_, _ = packet.bb.Write(buf)
+	return packet
+}
+
+func packUDPConn(c *stdConn, buf []byte) *udpConn {
+	_, _ = c.buffer.Write(buf)
+	packet := &udpConn{c: c}
+	return packet
+}
+
+func newTCPConn(conn net.Conn, el *eventloop) (c *stdConn) {
+	c = &stdConn{
 		conn:          conn,
 		loop:          el,
-		codec:         el.codec,
+		codec:         el.svr.codec,
 		inboundBuffer: prb.Get(),
 	}
+	c.localAddr = el.svr.ln.lnaddr
+	c.remoteAddr = c.conn.RemoteAddr()
+	if el.svr.opts.TCPKeepAlive > 0 {
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(el.svr.opts.TCPKeepAlive)
+		}
+	}
+	return
 }
 
 func (c *stdConn) releaseTCP() {
 	c.ctx = nil
 	c.localAddr = nil
 	c.remoteAddr = nil
+	c.conn = nil
 	prb.Put(c.inboundBuffer)
 	c.inboundBuffer = nil
 	bytebuffer.Put(c.buffer)
 	c.buffer = nil
 }
 
-func newUDPConn(el *eventloop, localAddr, remoteAddr net.Addr, buf *bytebuffer.ByteBuffer) *stdConn {
+func newUDPConn(el *eventloop, localAddr, remoteAddr net.Addr) *stdConn {
 	return &stdConn{
 		loop:       el,
+		buffer:     bytebuffer.Get(),
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
-		buffer:     buf,
 	}
 }
 
@@ -89,12 +125,8 @@ func (c *stdConn) read() ([]byte, error) {
 
 func (c *stdConn) Read() []byte {
 	if c.inboundBuffer.IsEmpty() {
-		if c.buffer.Len() == 0 {
-			return nil
-		}
 		return c.buffer.Bytes()
 	}
-	bytebuffer.Put(c.byteBuffer)
 	c.byteBuffer = c.inboundBuffer.WithByteBuffer(c.buffer.Bytes())
 	return c.byteBuffer.Bytes()
 }
@@ -104,6 +136,32 @@ func (c *stdConn) ResetBuffer() {
 	c.inboundBuffer.Reset()
 	bytebuffer.Put(c.byteBuffer)
 	c.byteBuffer = nil
+}
+
+func (c *stdConn) ReadN(n int) (size int, buf []byte) {
+	inBufferLen := c.inboundBuffer.Length()
+	tempBufferLen := c.buffer.Len()
+	if totalLen := inBufferLen + tempBufferLen; totalLen < n || n <= 0 {
+		n = totalLen
+	}
+	size = n
+	if c.inboundBuffer.IsEmpty() {
+		buf = c.buffer.B[:n]
+		return
+	}
+	head, tail := c.inboundBuffer.LazyRead(n)
+	c.byteBuffer = bytebuffer.Get()
+	_, _ = c.byteBuffer.Write(head)
+	_, _ = c.byteBuffer.Write(tail)
+	if inBufferLen >= n {
+		buf = c.byteBuffer.Bytes()
+		return
+	}
+
+	restSize := n - inBufferLen
+	_, _ = c.byteBuffer.Write(c.buffer.B[:restSize])
+	buf = c.byteBuffer.Bytes()
+	return
 }
 
 func (c *stdConn) ShiftN(n int) (size int) {
@@ -119,11 +177,10 @@ func (c *stdConn) ShiftN(n int) (size int) {
 		c.buffer.B = c.buffer.B[n:]
 		return
 	}
-	c.byteBuffer.B = c.byteBuffer.B[n:]
-	if c.byteBuffer.Len() == 0 {
-		bytebuffer.Put(c.byteBuffer)
-		c.byteBuffer = nil
-	}
+
+	bytebuffer.Put(c.byteBuffer)
+	c.byteBuffer = nil
+
 	if inBufferLen >= n {
 		c.inboundBuffer.Shift(n)
 		return
@@ -131,43 +188,7 @@ func (c *stdConn) ShiftN(n int) (size int) {
 	c.inboundBuffer.Reset()
 
 	restSize := n - inBufferLen
-	if restSize == tempBufferLen {
-		c.buffer.Reset()
-	} else {
-		c.buffer.B = c.buffer.B[restSize:]
-	}
-	return
-}
-
-func (c *stdConn) ReadN(n int) (size int, buf []byte) {
-	inBufferLen := c.inboundBuffer.Length()
-	tempBufferLen := c.buffer.Len()
-	if inBufferLen+tempBufferLen < n || n <= 0 {
-		return
-	}
-	size = n
-	if c.inboundBuffer.IsEmpty() {
-		buf = c.buffer.B[:n]
-		c.buffer.B = c.buffer.B[n:]
-		return
-	}
-	buf, tail := c.inboundBuffer.LazyRead(n)
-	if tail != nil {
-		buf = append(buf, tail...)
-	}
-	if inBufferLen >= n {
-		c.inboundBuffer.Shift(n)
-		return
-	}
-	c.inboundBuffer.Reset()
-
-	restSize := n - inBufferLen
-	buf = append(buf, c.buffer.B[:restSize]...)
-	if restSize == tempBufferLen {
-		c.buffer.Reset()
-	} else {
-		c.buffer.B = c.buffer.B[restSize:]
-	}
+	c.buffer.B = c.buffer.B[restSize:]
 	return
 }
 
@@ -175,17 +196,22 @@ func (c *stdConn) BufferLength() int {
 	return c.inboundBuffer.Length() + c.buffer.Len()
 }
 
-func (c *stdConn) AsyncWrite(buf []byte) {
-	if encodedBuf, err := c.codec.Encode(c, buf); err == nil {
-		c.loop.ch <- func() error {
-			_, _ = c.conn.Write(encodedBuf)
-			return nil
+func (c *stdConn) AsyncWrite(buf []byte) (err error) {
+	var encodedBuf []byte
+	if encodedBuf, err = c.codec.Encode(c, buf); err == nil {
+		c.loop.ch <- func() (err error) {
+			if c.conn != nil {
+				_, err = c.conn.Write(encodedBuf)
+			}
+			return
 		}
 	}
+	return
 }
 
-func (c *stdConn) SendTo(buf []byte) {
-	_, _ = c.loop.svr.ln.pconn.WriteTo(buf, c.remoteAddr)
+func (c *stdConn) SendTo(buf []byte) (err error) {
+	_, err = c.loop.svr.ln.pconn.WriteTo(buf, c.remoteAddr)
+	return
 }
 
 func (c *stdConn) Wake() error {
@@ -195,7 +221,7 @@ func (c *stdConn) Wake() error {
 
 func (c *stdConn) Close() error {
 	c.loop.ch <- func() error {
-		return c.loop.loopClose(c)
+		return c.loop.loopCloseConn(c)
 	}
 	return nil
 }
