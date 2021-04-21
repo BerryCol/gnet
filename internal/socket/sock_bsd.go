@@ -1,4 +1,5 @@
-// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2020 Andy Pan
+// Copyright (c) 2017 Ma Weiwei, Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,47 +19,35 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// +build linux freebsd dragonfly darwin
+// +build freebsd dragonfly darwin
 
-package gnet
+package socket
 
 import (
-	"os"
+	"runtime"
 
-	"github.com/panjf2000/gnet/errors"
-	"github.com/panjf2000/gnet/internal/socket"
 	"golang.org/x/sys/unix"
 )
 
-func (svr *server) acceptNewConnection(fd int) error {
-	nfd, sa, err := unix.Accept(fd)
-	if err != nil {
-		if err == unix.EAGAIN {
-			return nil
-		}
-		return errors.ErrAcceptSocket
+func maxListenerBacklog() int {
+	var (
+		n   uint32
+		err error
+	)
+	switch runtime.GOOS {
+	case "darwin":
+		n, err = unix.SysctlUint32("kern.ipc.somaxconn")
+	case "freebsd":
+		n, err = unix.SysctlUint32("kern.ipc.soacceptqueue")
 	}
-	if err = os.NewSyscallError("fcntl nonblock", unix.SetNonblock(nfd, true)); err != nil {
-		return err
+	if n == 0 || err != nil {
+		return unix.SOMAXCONN
 	}
-
-	netAddr := socket.SockaddrToTCPOrUnixAddr(sa)
-	el := svr.lb.next(netAddr)
-	c := newTCPConn(nfd, el, sa, netAddr)
-
-	err = el.poller.Trigger(func() (err error) {
-		if err = el.poller.AddRead(nfd); err != nil {
-			_ = unix.Close(nfd)
-			c.releaseTCP()
-			return
-		}
-		el.connections[nfd] = c
-		err = el.loopOpen(c)
-		return
-	})
-	if err != nil {
-		_ = unix.Close(nfd)
-		c.releaseTCP()
+	// FreeBSD stores the backlog in a uint16, as does Linux.
+	// Assume the other BSDs do too. Truncate number to avoid wrapping.
+	// See issue 5030.
+	if n > 1<<16-1 {
+		n = 1<<16 - 1
 	}
-	return nil
+	return int(n)
 }

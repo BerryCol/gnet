@@ -81,11 +81,24 @@ func newTCPConn(conn net.Conn, el *eventloop) (c *stdConn) {
 	}
 	c.localAddr = el.svr.ln.lnaddr
 	c.remoteAddr = c.conn.RemoteAddr()
+
+	var (
+		ok bool
+		tc *net.TCPConn
+	)
+	if tc, ok = conn.(*net.TCPConn); !ok {
+		return
+	}
+	var noDelay bool
+	switch el.svr.opts.TCPNoDelay {
+	case TCPNoDelay:
+		noDelay = true
+	case TCPDelay:
+	}
+	_ = tc.SetNoDelay(noDelay)
 	if el.svr.opts.TCPKeepAlive > 0 {
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetKeepAlive(true)
-			_ = tc.SetKeepAlivePeriod(el.svr.opts.TCPKeepAlive)
-		}
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(el.svr.opts.TCPKeepAlive)
 	}
 	return
 }
@@ -96,7 +109,7 @@ func (c *stdConn) releaseTCP() {
 	c.remoteAddr = nil
 	c.conn = nil
 	prb.Put(c.inboundBuffer)
-	c.inboundBuffer = nil
+	c.inboundBuffer = ringbuffer.EmptyRingBuffer
 	bytebuffer.Put(c.buffer)
 	c.buffer = nil
 }

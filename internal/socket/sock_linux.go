@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2017 Ma Weiwei, Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,47 +18,46 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// +build linux freebsd dragonfly darwin
-
-package gnet
+package socket
 
 import (
+	"bufio"
 	"os"
+	"strconv"
+	"strings"
 
-	"github.com/panjf2000/gnet/errors"
-	"github.com/panjf2000/gnet/internal/socket"
 	"golang.org/x/sys/unix"
 )
 
-func (svr *server) acceptNewConnection(fd int) error {
-	nfd, sa, err := unix.Accept(fd)
+func maxListenerBacklog() int {
+	fd, err := os.Open("/proc/sys/net/core/somaxconn")
 	if err != nil {
-		if err == unix.EAGAIN {
-			return nil
-		}
-		return errors.ErrAcceptSocket
+		return unix.SOMAXCONN
 	}
-	if err = os.NewSyscallError("fcntl nonblock", unix.SetNonblock(nfd, true)); err != nil {
-		return err
+	defer fd.Close()
+
+	rd := bufio.NewReader(fd)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		return unix.SOMAXCONN
 	}
 
-	netAddr := socket.SockaddrToTCPOrUnixAddr(sa)
-	el := svr.lb.next(netAddr)
-	c := newTCPConn(nfd, el, sa, netAddr)
-
-	err = el.poller.Trigger(func() (err error) {
-		if err = el.poller.AddRead(nfd); err != nil {
-			_ = unix.Close(nfd)
-			c.releaseTCP()
-			return
-		}
-		el.connections[nfd] = c
-		err = el.loopOpen(c)
-		return
-	})
-	if err != nil {
-		_ = unix.Close(nfd)
-		c.releaseTCP()
+	f := strings.Fields(line)
+	if len(f) < 1 {
+		return unix.SOMAXCONN
 	}
-	return nil
+
+	n, err := strconv.Atoi(f[0])
+	if err != nil || n == 0 {
+		return unix.SOMAXCONN
+	}
+
+	// Linux stores the backlog in a uint16.
+	// Truncate number to avoid wrapping.
+	// See issue 5030.
+	if n > 1<<16-1 {
+		n = 1<<16 - 1
+	}
+
+	return n
 }

@@ -57,18 +57,11 @@ func (el *eventloop) loopRun(lockOSThread bool) {
 
 	var err error
 	defer func() {
-		if el.idx == 0 && el.svr.opts.Ticker {
-			close(el.svr.ticktock)
-		}
 		el.svr.signalShutdownWithErr(err)
 		el.svr.loopWG.Done()
 		el.loopEgress()
 		el.svr.loopWG.Done()
 	}()
-
-	if el.idx == 0 && el.svr.opts.Ticker {
-		go el.loopTicker()
-	}
 
 	for v := range el.ch {
 		switch v := v.(type) {
@@ -110,13 +103,13 @@ func (el *eventloop) loopAccept(c *stdConn) error {
 	return el.handleAction(c, action)
 }
 
-func (el *eventloop) loopRead(c *stdConn) (err error) {
+func (el *eventloop) loopRead(c *stdConn) error {
 	for inFrame, _ := c.read(); inFrame != nil; inFrame, _ = c.read() {
 		out, action := el.eventHandler.React(inFrame, c)
 		if out != nil {
 			outFrame, _ := c.codec.Encode(c, out)
 			el.eventHandler.PreWrite()
-			if _, err = c.conn.Write(outFrame); err != nil {
+			if _, err := c.conn.Write(outFrame); err != nil {
 				return el.loopError(c, err)
 			}
 		}
@@ -132,11 +125,14 @@ func (el *eventloop) loopRead(c *stdConn) (err error) {
 	bytebuffer.Put(c.buffer)
 	c.buffer = nil
 
-	return
+	return nil
 }
 
 func (el *eventloop) loopCloseConn(c *stdConn) error {
-	return c.conn.SetReadDeadline(time.Now())
+	if c.conn != nil {
+		return c.conn.SetReadDeadline(time.Now())
+	}
+	return nil
 }
 
 func (el *eventloop) loopEgress() {
@@ -184,7 +180,11 @@ func (el *eventloop) loopTicker() {
 
 func (el *eventloop) loopError(c *stdConn, err error) (e error) {
 	defer func() {
-		if err := c.conn.Close(); err != nil {
+		if _, ok := el.connections[c]; !ok {
+			return // ignore stale wakes.
+		}
+
+		if err = c.conn.Close(); err != nil {
 			el.svr.logger.Warnf("Failed to close connection(%s), error: %v", c.remoteAddr.String(), err)
 			if e == nil {
 				e = err
@@ -204,9 +204,10 @@ func (el *eventloop) loopError(c *stdConn, err error) (e error) {
 }
 
 func (el *eventloop) loopWake(c *stdConn) error {
-	//if co, ok := el.connections[c]; !ok || co != c {
-	//	return nil // ignore stale wakes.
-	//}
+	if _, ok := el.connections[c]; !ok {
+		return nil // ignore stale wakes.
+	}
+
 	out, action := el.eventHandler.React(nil, c)
 	if out != nil {
 		if frame, err := c.codec.Encode(c, out); err != nil {

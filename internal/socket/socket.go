@@ -1,4 +1,5 @@
-// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2020 Andy Pan
+// Copyright (c) 2017 Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,47 +19,34 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+// Package reuseport provides functions that return fd and net.Addr based on
+// given the protocol and address with a SO_REUSEPORT option set to the socket.
+
 // +build linux freebsd dragonfly darwin
 
-package gnet
+package socket
 
 import (
-	"os"
-
-	"github.com/panjf2000/gnet/errors"
-	"github.com/panjf2000/gnet/internal/socket"
-	"golang.org/x/sys/unix"
+	"net"
 )
 
-func (svr *server) acceptNewConnection(fd int) error {
-	nfd, sa, err := unix.Accept(fd)
-	if err != nil {
-		if err == unix.EAGAIN {
-			return nil
-		}
-		return errors.ErrAcceptSocket
-	}
-	if err = os.NewSyscallError("fcntl nonblock", unix.SetNonblock(nfd, true)); err != nil {
-		return err
-	}
+// Option is used for setting an option on socket.
+type Option struct {
+	SetSockopt func(int, int) error
+	Opt        int
+}
 
-	netAddr := socket.SockaddrToTCPOrUnixAddr(sa)
-	el := svr.lb.next(netAddr)
-	c := newTCPConn(nfd, el, sa, netAddr)
+// TCPSocket calls the internal tcpSocket.
+func TCPSocket(proto, addr string, sockopts ...Option) (int, net.Addr, error) {
+	return tcpSocket(proto, addr, sockopts...)
+}
 
-	err = el.poller.Trigger(func() (err error) {
-		if err = el.poller.AddRead(nfd); err != nil {
-			_ = unix.Close(nfd)
-			c.releaseTCP()
-			return
-		}
-		el.connections[nfd] = c
-		err = el.loopOpen(c)
-		return
-	})
-	if err != nil {
-		_ = unix.Close(nfd)
-		c.releaseTCP()
-	}
-	return nil
+// UDPSocket calls the internal udpSocket.
+func UDPSocket(proto, addr string, sockopts ...Option) (int, net.Addr, error) {
+	return udpSocket(proto, addr, sockopts...)
+}
+
+// UnixSocket calls the internal udsSocket.
+func UnixSocket(proto, addr string, sockopts ...Option) (int, net.Addr, error) {
+	return udsSocket(proto, addr, sockopts...)
 }

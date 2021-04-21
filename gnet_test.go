@@ -38,7 +38,6 @@ import (
 	"github.com/panjf2000/gnet/errors"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
 	"github.com/panjf2000/gnet/pool/goroutine"
-	"github.com/valyala/bytebufferpool"
 	"go.uber.org/zap"
 )
 
@@ -259,13 +258,8 @@ func testCodecServe(network, addr string, multicore, async bool, nclients int, r
 		network: network, addr: addr, multicore: multicore, async: async, nclients: nclients,
 		codec: codec, workerPool: goroutine.Default(),
 	}
-	if reuseport {
-		err = Serve(ts, network+"://"+addr, WithMulticore(multicore), WithTicker(true),
-			WithTCPKeepAlive(time.Minute*5), WithCodec(codec), WithReusePort(true))
-	} else {
-		err = Serve(ts, network+"://"+addr, WithMulticore(multicore), WithTicker(true),
-			WithTCPKeepAlive(time.Minute*5), WithCodec(codec))
-	}
+	err = Serve(ts, network+"://"+addr, WithMulticore(multicore), WithTicker(true),
+		WithTCPKeepAlive(time.Minute*5), WithSocketRecvBuffer(8*1024), WithSocketSendBuffer(8*1024), WithCodec(codec), WithReusePort(reuseport))
 	if err != nil {
 		panic(err)
 	}
@@ -431,7 +425,6 @@ type testServer struct {
 	clientActive int32
 	disconnected int32
 	workerPool   *goroutine.Pool
-	bytesList    []*bytebufferpool.ByteBuffer
 }
 
 func (s *testServer) OnInitComplete(svr Server) (action Action) {
@@ -464,9 +457,6 @@ func (s *testServer) OnClosed(c Conn, err error) (action Action) {
 	if atomic.LoadInt32(&s.connected) == atomic.LoadInt32(&s.disconnected) &&
 		atomic.LoadInt32(&s.disconnected) == int32(s.nclients) {
 		action = Shutdown
-		for i := range s.bytesList {
-			bytebuffer.Put(s.bytesList[i])
-		}
 		s.workerPool.Release()
 	}
 
@@ -477,7 +467,6 @@ func (s *testServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	if s.async {
 		buf := bytebuffer.Get()
 		_, _ = buf.Write(frame)
-		s.bytesList = append(s.bytesList, buf)
 
 		if s.network == "tcp" || s.network == "unix" {
 			// just for test
@@ -532,7 +521,7 @@ func testServe(network, addr string, reuseport, multicore, async bool, nclients 
 		workerPool: goroutine.Default(),
 	}
 	must(Serve(ts, network+"://"+addr, WithLockOSThread(async), WithMulticore(multicore), WithReusePort(reuseport), WithTicker(true),
-		WithTCPKeepAlive(time.Minute*1), WithLoadBalancing(lb)))
+		WithTCPKeepAlive(time.Minute*1), WithTCPNoDelay(TCPDelay), WithLoadBalancing(lb)))
 }
 
 func startClient(network, addr string, multicore, async bool) {
@@ -594,8 +583,29 @@ func TestDefaultGnetServer(t *testing.T) {
 	svr.Tick()
 }
 
+type testBadAddrServer struct {
+	*EventServer
+}
+
+func (t *testBadAddrServer) OnInitComplete(srv Server) (action Action) {
+	return Shutdown
+}
+
+func TestBadAddresses(t *testing.T) {
+	events := new(testBadAddrServer)
+	if err := Serve(events, "tulip://howdy"); err == nil {
+		t.Fatalf("expected error")
+	}
+	if err := Serve(events, "howdy"); err == nil {
+		t.Fatalf("expected error")
+	}
+	if err := Serve(events, "tcp://"); err != nil {
+		t.Fatalf("expected nil, got '%v'", err)
+	}
+}
+
 func TestTick(t *testing.T) {
-	testTick("tcp4", ":9991", t)
+	testTick("tcp", ":9989", t)
 }
 
 type testTickServer struct {
@@ -625,19 +635,20 @@ func testTick(network, addr string, t *testing.T) {
 }
 
 func TestWakeConn(t *testing.T) {
-	testWakeConn("tcp", ":9000")
+	testWakeConn("tcp", ":9990")
 }
 
 type testWakeConnServer struct {
 	*EventServer
 	network string
 	addr    string
-	conn    Conn
+	conn    chan Conn
+	c       Conn
 	wake    bool
 }
 
 func (t *testWakeConnServer) OnOpened(c Conn) (out []byte, action Action) {
-	t.conn = c
+	t.conn <- c
 	return
 }
 
@@ -669,13 +680,14 @@ func (t *testWakeConnServer) Tick() (delay time.Duration, action Action) {
 		}()
 		return
 	}
-	_ = t.conn.Wake()
+	t.c = <-t.conn
+	_ = t.c.Wake()
 	delay = time.Millisecond * 100
 	return
 }
 
 func testWakeConn(network, addr string) {
-	svr := &testWakeConnServer{network: network, addr: addr}
+	svr := &testWakeConnServer{network: network, addr: addr, conn: make(chan Conn, 1)}
 	logger := zap.NewExample()
 	must(Serve(svr, network+"://"+addr, WithTicker(true), WithNumEventLoop(2*runtime.NumCPU()),
 		WithLogger(logger.Sugar())))
@@ -735,29 +747,8 @@ func testShutdown(network, addr string) {
 	}
 }
 
-type testBadAddrServer struct {
-	*EventServer
-}
-
-func (t *testBadAddrServer) OnInitComplete(srv Server) (action Action) {
-	return Shutdown
-}
-
-func TestBadAddresses(t *testing.T) {
-	events := new(testBadAddrServer)
-	if err := Serve(events, "tulip://howdy"); err == nil {
-		t.Fatalf("expected error")
-	}
-	if err := Serve(events, "howdy"); err == nil {
-		t.Fatalf("expected error")
-	}
-	if err := Serve(events, "tcp://"); err != nil {
-		t.Fatalf("expected nil, got '%v'", err)
-	}
-}
-
 func TestCloseActionError(t *testing.T) {
-	testCloseActionError("tcp", ":9991")
+	testCloseActionError("tcp", ":9992")
 }
 
 type testCloseActionErrorServer struct {
@@ -805,7 +796,7 @@ func testCloseActionError(network, addr string) {
 }
 
 func TestShutdownActionError(t *testing.T) {
-	testShutdownActionError("tcp", ":9991")
+	testShutdownActionError("tcp", ":9993")
 }
 
 type testShutdownActionErrorServer struct {
@@ -849,7 +840,7 @@ func testShutdownActionError(network, addr string) {
 }
 
 func TestCloseActionOnOpen(t *testing.T) {
-	testCloseActionOnOpen("tcp", ":9991")
+	testCloseActionOnOpen("tcp", ":9994")
 }
 
 type testCloseActionOnOpenServer struct {
@@ -889,7 +880,7 @@ func testCloseActionOnOpen(network, addr string) {
 }
 
 func TestShutdownActionOnOpen(t *testing.T) {
-	testShutdownActionOnOpen("tcp", ":9991")
+	testShutdownActionOnOpen("tcp", ":9995")
 }
 
 type testShutdownActionOnOpenServer struct {
@@ -974,7 +965,7 @@ func testUDPShutdown(network, addr string) {
 }
 
 func TestCloseConnection(t *testing.T) {
-	testCloseConnection("tcp", ":9992")
+	testCloseConnection("tcp", ":9996")
 }
 
 type testCloseConnectionServer struct {
@@ -1038,7 +1029,7 @@ func TestServerOptionsCheck(t *testing.T) {
 }
 
 func TestStop(t *testing.T) {
-	testStop("tcp", ":9993")
+	testStop("tcp", ":9997")
 }
 
 type testStopServer struct {
@@ -1093,4 +1084,84 @@ func (t *testStopServer) Tick() (delay time.Duration, action Action) {
 func testStop(network, addr string) {
 	events := &testStopServer{network: network, addr: addr, protoAddr: network + "://" + addr}
 	must(Serve(events, events.protoAddr, WithTicker(true)))
+}
+
+type testClosedWakeUpServer struct {
+	*EventServer
+	network, addr, protoAddr string
+
+	readen       chan struct{}
+	serverClosed chan struct{}
+	clientClosed chan struct{}
+}
+
+func (tes *testClosedWakeUpServer) OnInitComplete(_ Server) (action Action) {
+	go func() {
+		c, err := net.Dial(tes.network, tes.addr)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = c.Write([]byte("hello"))
+		if err != nil {
+			panic(err)
+		}
+
+		<-tes.readen
+		_, err = c.Write([]byte("hello again"))
+		if err != nil {
+			panic(err)
+		}
+
+		must(c.Close())
+		close(tes.clientClosed)
+		<-tes.serverClosed
+
+		fmt.Println("stop server...", Stop(context.TODO(), tes.protoAddr))
+	}()
+
+	return None
+}
+
+func (tes *testClosedWakeUpServer) React(_ []byte, conn Conn) ([]byte, Action) {
+	if conn.RemoteAddr() == nil {
+		panic("react on closed conn")
+	}
+
+	select {
+	case <-tes.readen:
+	default:
+		close(tes.readen)
+	}
+
+	// actually goroutines here needed only on windows since its async actions
+	// rely on an unbuffered channel and since we already into it - this will
+	// block forever.
+	go func() { must(conn.Wake()) }()
+	go func() { must(conn.Close()) }()
+
+	<-tes.clientClosed
+
+	return []byte("answer"), None
+}
+
+func (tes *testClosedWakeUpServer) OnClosed(c Conn, err error) (action Action) {
+	select {
+	case <-tes.serverClosed:
+	default:
+		close(tes.serverClosed)
+	}
+	return
+}
+
+// Test should not panic when we wake-up server_closed conn.
+func TestClosedWakeUp(t *testing.T) {
+	events := &testClosedWakeUpServer{
+		EventServer: &EventServer{}, network: "tcp", addr: ":8888", protoAddr: "tcp://:8888",
+		clientClosed: make(chan struct{}),
+		serverClosed: make(chan struct{}),
+		readen:       make(chan struct{}),
+	}
+
+	must(Serve(events, events.protoAddr))
 }

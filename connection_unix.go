@@ -19,6 +19,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+//go:build linux || freebsd || dragonfly || darwin
 // +build linux freebsd dragonfly darwin
 
 package gnet
@@ -26,9 +27,8 @@ package gnet
 import (
 	"net"
 	"os"
-	"time"
 
-	"github.com/panjf2000/gnet/internal/netpoll"
+	"github.com/panjf2000/gnet/internal/socket"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
 	prb "github.com/panjf2000/gnet/pool/ringbuffer"
 	"github.com/panjf2000/gnet/ringbuffer"
@@ -51,22 +51,16 @@ type conn struct {
 }
 
 func newTCPConn(fd int, el *eventloop, sa unix.Sockaddr, remoteAddr net.Addr) (c *conn) {
-	c = &conn{
+	return &conn{
 		fd:             fd,
 		sa:             sa,
 		loop:           el,
 		codec:          el.svr.codec,
+		localAddr:      el.ln.lnaddr,
+		remoteAddr:     remoteAddr,
 		inboundBuffer:  prb.Get(),
 		outboundBuffer: prb.Get(),
 	}
-	c.localAddr = el.ln.lnaddr
-	c.remoteAddr = remoteAddr
-	if el.svr.opts.TCPKeepAlive > 0 {
-		if proto := el.ln.network; proto == "tcp" || proto == "unix" {
-			_ = netpoll.SetKeepAlive(fd, int(el.svr.opts.TCPKeepAlive/time.Second))
-		}
-	}
-	return
 }
 
 func (c *conn) releaseTCP() {
@@ -78,8 +72,8 @@ func (c *conn) releaseTCP() {
 	c.remoteAddr = nil
 	prb.Put(c.inboundBuffer)
 	prb.Put(c.outboundBuffer)
-	c.inboundBuffer = nil
-	c.outboundBuffer = nil
+	c.inboundBuffer = ringbuffer.EmptyRingBuffer
+	c.outboundBuffer = ringbuffer.EmptyRingBuffer
 	bytebuffer.Put(c.byteBuffer)
 	c.byteBuffer = nil
 }
@@ -89,7 +83,7 @@ func newUDPConn(fd int, el *eventloop, sa unix.Sockaddr) *conn {
 		fd:         fd,
 		sa:         sa,
 		localAddr:  el.ln.lnaddr,
-		remoteAddr: netpoll.SockaddrToUDPAddr(sa),
+		remoteAddr: socket.SockaddrToUDPAddr(sa),
 	}
 }
 
@@ -120,6 +114,8 @@ func (c *conn) write(buf []byte) (err error) {
 	if outFrame, err = c.codec.Encode(c, buf); err != nil {
 		return
 	}
+	// If there is pending data in outbound buffer, the current data ought to be appended to the outbound buffer
+	// for maintaining the sequence of network packets.
 	if !c.outboundBuffer.IsEmpty() {
 		_, _ = c.outboundBuffer.Write(outFrame)
 		return
@@ -127,6 +123,7 @@ func (c *conn) write(buf []byte) (err error) {
 
 	var n int
 	if n, err = unix.Write(c.fd, outFrame); err != nil {
+		// A temporary error occurs, append the data to outbound buffer, writing it back to client in the next round.
 		if err == unix.EAGAIN {
 			_, _ = c.outboundBuffer.Write(outFrame)
 			err = c.loop.poller.ModReadWrite(c.fd)
@@ -134,6 +131,7 @@ func (c *conn) write(buf []byte) (err error) {
 		}
 		return c.loop.loopCloseConn(c, os.NewSyscallError("write", err))
 	}
+	// Fail to send all data back to client, buffer the leftover data for the next round.
 	if n < len(outFrame) {
 		_, _ = c.outboundBuffer.Write(outFrame[n:])
 		err = c.loop.poller.ModReadWrite(c.fd)
@@ -221,11 +219,11 @@ func (c *conn) BufferLength() int {
 }
 
 func (c *conn) AsyncWrite(buf []byte) error {
-	return c.loop.poller.Trigger(func() (err error) {
+	return c.loop.poller.Trigger(func() error {
 		if c.opened {
-			err = c.write(buf)
+			return c.write(buf)
 		}
-		return
+		return nil
 	})
 }
 
