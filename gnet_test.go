@@ -301,13 +301,13 @@ func (s *testServer) OnTraffic(c Conn) (action Action) {
 						bs := make([][]byte, 2)
 						bs[0] = buf.B[:mid]
 						bs[1] = buf.B[mid:]
-						_ = c.AsyncWritev(bs, func(c Conn) error {
-							logging.Debugf("conn=%s done writev", c.RemoteAddr().String())
+						_ = c.AsyncWritev(bs, func(c Conn, err error) error {
+							logging.Debugf("conn=%s done writev: %v", c.RemoteAddr().String(), err)
 							return nil
 						})
 					} else {
-						_ = c.AsyncWrite(buf.Bytes(), func(c Conn) error {
-							logging.Debugf("conn=%s done write", c.RemoteAddr().String())
+						_ = c.AsyncWrite(buf.Bytes(), func(c Conn, err error) error {
+							logging.Debugf("conn=%s done write: %v", c.RemoteAddr().String(), err)
 							return nil
 						})
 					}
@@ -514,8 +514,8 @@ func (t *testWakeConnServer) OnTick() (delay time.Duration, action Action) {
 		return
 	}
 	t.c = <-t.conn
-	_ = t.c.Wake(func(c Conn) error {
-		logging.Debugf("conn=%s done wake", c.RemoteAddr().String())
+	_ = t.c.Wake(func(c Conn, err error) error {
+		logging.Debugf("conn=%s done wake: %v", c.RemoteAddr().String(), err)
 		return nil
 	})
 	delay = time.Millisecond * 100
@@ -932,7 +932,7 @@ func testStop(t *testing.T, network, addr string) {
 func TestClosedWakeUp(t *testing.T) {
 	events := &testClosedWakeUpServer{
 		tester:             t,
-		BuiltinEventEngine: &BuiltinEventEngine{}, network: "tcp", addr: ":8888", protoAddr: "tcp://:8888",
+		BuiltinEventEngine: &BuiltinEventEngine{}, network: "tcp", addr: ":9998", protoAddr: "tcp://:9998",
 		clientClosed: make(chan struct{}),
 		serverClosed: make(chan struct{}),
 		wakeup:       make(chan struct{}),

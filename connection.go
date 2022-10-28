@@ -219,7 +219,7 @@ func (c *conn) asyncWrite(itf interface{}) (err error) {
 	hook := itf.(*asyncWriteHook)
 	_, err = c.write(hook.data)
 	if hook.callback != nil {
-		_ = hook.callback(c)
+		_ = hook.callback(c, err)
 	}
 	return
 }
@@ -237,7 +237,7 @@ func (c *conn) asyncWritev(itf interface{}) (err error) {
 	hook := itf.(*asyncWritevHook)
 	_, err = c.writev(hook.data)
 	if hook.callback != nil {
-		_ = hook.callback(c)
+		_ = hook.callback(c, err)
 	}
 	return
 }
@@ -260,7 +260,10 @@ func (c *conn) Read(p []byte) (n int, err error) {
 	if c.inboundBuffer.IsEmpty() {
 		n = copy(p, c.buffer)
 		c.buffer = c.buffer[n:]
-		return n, nil
+		if n == 0 && len(p) > 0 {
+			err = io.EOF
+		}
+		return
 	}
 	n, _ = c.inboundBuffer.Read(p)
 	if n == len(p) {
@@ -353,7 +356,7 @@ func (c *conn) Discard(n int) (int, error) {
 func (c *conn) Write(p []byte) (int, error) {
 	if c.isDatagram {
 		if err := c.sendTo(p); err != nil {
-			return -1, err
+			return 0, err
 		}
 		return len(p), nil
 	}
@@ -362,7 +365,7 @@ func (c *conn) Write(p []byte) (int, error) {
 
 func (c *conn) Writev(bs [][]byte) (int, error) {
 	if c.isDatagram {
-		return -1, gerrors.ErrUnsupportedOp
+		return 0, gerrors.ErrUnsupportedOp
 	}
 	return c.writev(bs)
 }
@@ -435,7 +438,7 @@ func (c *conn) AsyncWrite(buf []byte, callback AsyncCallback) error {
 	if c.isDatagram {
 		defer func() {
 			if callback != nil {
-				_ = callback(nil)
+				_ = callback(nil, nil)
 			}
 		}()
 		return c.sendTo(buf)
@@ -454,7 +457,7 @@ func (c *conn) Wake(callback AsyncCallback) error {
 	return c.loop.poller.UrgentTrigger(func(_ interface{}) (err error) {
 		err = c.loop.wake(c)
 		if callback != nil {
-			_ = callback(c)
+			_ = callback(c, err)
 		}
 		return
 	}, nil)
@@ -464,7 +467,7 @@ func (c *conn) CloseWithCallback(callback AsyncCallback) error {
 	return c.loop.poller.Trigger(func(_ interface{}) (err error) {
 		err = c.loop.closeConn(c, nil)
 		if callback != nil {
-			_ = callback(c)
+			_ = callback(c, err)
 		}
 		return
 	}, nil)

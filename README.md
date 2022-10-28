@@ -16,6 +16,12 @@
 
 English | [中文](README_ZH.md)
 
+### ⚠️ Before you file any Github issues about gnet
+
+Please read [<u>*How To Ask Questions The Smart Way*</u>](http://www.catb.org/~esr/faqs/smart-questions.html) before you file an issue formally.
+
+**Furthermore, please comply with the issue template instead of just filling it out yourself, otherwise your issue may not be accepted or may even be closed outright.**
+
 # 📖 Introduction
 
 `gnet` is an event-driven networking framework that is fast and lightweight. It makes direct [epoll](https://en.wikipedia.org/wiki/Epoll) and [kqueue](https://en.wikipedia.org/wiki/Kqueue) syscalls rather than using the standard Go [net](https://golang.org/pkg/net/) package and works in a similar manner as [netty](https://github.com/netty/netty) and [libuv](https://github.com/libuv/libuv), which makes `gnet` achieve a much higher performance than Go [net](https://golang.org/pkg/net/).
@@ -38,6 +44,9 @@ English | [中文](README_ZH.md)
 - [x] Supporting two event-driven mechanisms: `epoll` on **Linux** and `kqueue` on **FreeBSD/DragonFly/Darwin**
 - [x] Flexible ticker event
 - [x] Implementation of `gnet` Client
+- [ ] **Windows** platform support ([gnet v1](https://github.com/panjf2000/gnet/tree/1.x) is available on Windows, v2 not yet)
+- [ ] **TLS** support
+- [ ] [io_uring](https://kernel.dk/io_uring.pdf) support
 
 # 🎬 Getting started
 
